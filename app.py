@@ -89,15 +89,15 @@ def clean(t: str) -> str:
 
 def strip_dbpia_markup(text: str) -> str:
     """
-    DBpia 검색 결과에 끼는 하이라이트/마크업 제거:
+    DBpia 검색 결과 하이라이트/마크업 제거:
     - <!HS>면역<!HE>
-    - &lt;!HS&gt;...&lt;!HE&gt; (escape)
+    - &lt;!HS&gt;...&lt;!HE&gt;
     """
     if not text:
         return ""
-    t = html.unescape(text)  # &lt;!HS&gt; -> <!HS>
+    t = html.unescape(text)
     t = t.replace("<!HS>", "").replace("<!HE>", "")
-    t = re.sub(r"<!H[SE]>", "", t)  # 방어적
+    t = re.sub(r"<!H[SE]>", "", t)
     t = t.replace("<b>", "").replace("</b>", "")
     return t.strip()
 
@@ -155,7 +155,7 @@ def apa_news(row):
 
 def apa_paper(row):
     """
-    논문 APA7 (가능한 필드로 최대한 정확히)
+    논문 APA7:
     - 저자. (연도). 제목. 학술지, 권(호), 시작–끝. DOI or URL
     """
     authors = format_authors_apa_kor(row.get("저자", ""))
@@ -302,7 +302,7 @@ def search_news(q):
     return out
 
 # =====================
-# DBpia 검색 (권/호 파싱 + 멀티쿼리 + 디버그)
+# DBpia 검색 (권/호 파싱 + 멀티쿼리)  ✅ 디버그 출력 제거됨
 # =====================
 DBPIA_BASE_URLS = [
     "http://api.dbpia.co.kr/v2/search/search.xml",
@@ -377,7 +377,6 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
     for item in root.findall(".//item"):
         title = strip_dbpia_markup(safe_get_text(item.find("title"), ""))
 
-        # 저자들
         author_names = []
         authors = item.find("authors")
         if authors is not None:
@@ -387,14 +386,12 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
                     author_names.append(name)
         author_str = ", ".join(author_names) if author_names else ""
 
-        # 학술지명
         pub_name = ""
         publication = item.find("publication")
         if publication is not None:
             pub_name = publication.get("name") or safe_get_text(publication.find("name"), "")
         pub_name = strip_dbpia_markup(pub_name)
 
-        # issue 파싱 강화
         year = ""
         pubdate = ""
         vol = ""
@@ -476,6 +473,9 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
     return df
 
 def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True, itype: int = 1) -> pd.DataFrame:
+    """
+    ✅ 디버그 출력 제거: 실패 페이지는 조용히 스킵
+    """
     base_cols = ["제목", "저자", "학술지", "연도", "발행일", "권", "호", "페이지", "DOI", "링크", "DBpiaID"]
     if not dbpia_key:
         return pd.DataFrame(columns=base_cols)
@@ -501,19 +501,7 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True,
             params["sortorder"] = "desc"
 
         ok, xml_or_err = dbpia_request(params)
-
-        with st.expander(f"🧪 DBpia debug (q='{keyword}' / itype={itype} / page={p})", expanded=False):
-            st.write("request params:", params)
-            if ok:
-                code, msg = extract_dbpia_error(xml_or_err)
-                st.write("error code:", code)
-                st.write("error msg:", msg)
-                st.text(xml_or_err[:1500])
-            else:
-                st.write("request failed:", xml_or_err)
-
         if not ok:
-            st.warning(f"DBpia API 호출 실패(q={keyword}, itype={itype}, p={p}): {xml_or_err}")
             continue
 
         df = parse_dbpia_xml(xml_or_err)
