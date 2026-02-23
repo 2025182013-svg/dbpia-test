@@ -3,6 +3,7 @@ import requests, html, json, os, re
 from datetime import datetime
 from openai import OpenAI
 import pandas as pd
+import xml.etree.ElementTree as ET
 
 # =====================
 # 기본 설정
@@ -24,6 +25,15 @@ st.sidebar.header("🔑 API 설정")
 openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
 naver_id = st.sidebar.text_input("Naver Client ID", type="password")
 naver_secret = st.sidebar.text_input("Naver Client Secret", type="password")
+
+# ✅ DBpia (추가)
+st.sidebar.markdown("---")
+st.sidebar.subheader("📄 DBpia 설정 (선택)")
+dbpia_key = st.sidebar.text_input("DBpia OpenAPI Key", type="password")
+st.sidebar.caption(
+    "DBpia OpenAPI에서 **검색 API 키**를 발급받아 입력하세요. "
+    "원문 제공은 별도 계약이 필요할 수 있어요."
+)
 
 if not openai_key or not naver_id or not naver_secret:
     st.warning("⬅️ 사이드바에 모든 API 키를 입력하세요.")
@@ -49,33 +59,39 @@ MODE_CONFIG = {
 # =====================
 # 유틸
 # =====================
-def clean(t):
+def clean(t: str) -> str:
     return html.unescape(t).replace("<b>", "").replace("</b>", "").strip()
 
-def parse_date(d):
+def parse_date(d: str):
     try:
         return datetime.strptime(d, "%a, %d %b %Y %H:%M:%S %z")
     except:
         return None
 
-def format_source(domain):
+def format_source(domain: str) -> str:
     return domain.replace("www.", "").split(".")[0].capitalize()
 
-def slugify(text):
+def slugify(text: str) -> str:
     text = re.sub(r"[^\w\s-]", "", text)
     text = text.strip().replace(" ", "_")
     return text
 
-def pretty(text):
+def pretty(text: str) -> str:
     return text.replace("_", " ")
+
+def safe_get_text(elem, default=""):
+    if elem is None:
+        return default
+    txt = (elem.text or "").strip()
+    return txt if txt else default
 
 # =====================
 # APA7 뉴스
 # =====================
 def apa_news(row):
     author = row.get("출처", "News")
-    year = row["발행일"][:4] if row["발행일"] else "n.d."
-    return f"{author}. ({year}). {row['제목']}. {row['출처']}. {row['링크']}"
+    year = row["발행일"][:4] if row.get("발행일") else "n.d."
+    return f"{author}. ({year}). {row.get('제목','')}. {row.get('출처','')}. {row.get('링크','')}"
 
 # =====================
 # AI
@@ -84,7 +100,7 @@ def gen_questions(topic):
     prompt = f"다음 주제에 대한 연구 질문 3개 생성:\n{topic}"
     r = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
     return [q.strip("-• ").strip() for q in r.choices[0].message.content.split("\n") if q.strip()]
@@ -93,16 +109,16 @@ def gen_keywords(topic):
     prompt = f"다음 주제의 핵심 키워드 6개를 중요도순 쉼표 출력:\n{topic}"
     r = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.2
     )
-    return [k.strip() for k in r.choices[0].message.content.split(",")]
+    return [k.strip() for k in r.choices[0].message.content.split(",") if k.strip()]
 
 def gen_trend_summary(keywords):
     prompt = f"키워드 기반 연구 동향 요약:\n{', '.join(keywords)}"
     r = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.2
     )
     return r.choices[0].message.content.strip()
@@ -116,7 +132,7 @@ def relevance(topic, n):
 """
     r = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
     try:
@@ -125,7 +141,7 @@ def relevance(topic, n):
         return 0
 
 # =====================
-# 뉴스 검색
+# 뉴스 검색 (Naver)
 # =====================
 def search_news(q):
     url = "https://openapi.naver.com/v1/search/news.json"
@@ -134,24 +150,192 @@ def search_news(q):
         "X-Naver-Client-Secret": naver_secret
     }
     params = {"query": q, "display": 40, "sort": "date"}
-    r = requests.get(url, headers=headers, params=params).json()
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        data = r.json()
+    except Exception as e:
+        st.warning(f"네이버 뉴스 API 호출 실패: {e}")
+        return []
 
     out = []
-    for i in r.get("items", []):
+    for i in data.get("items", []):
+        link = i.get("link", "")
+        domain = ""
+        try:
+            domain = link.split("/")[2] if link else ""
+        except:
+            domain = ""
+        pd_dt = parse_date(i.get("pubDate", ""))
         out.append({
-            "제목": clean(i["title"]),
-            "요약": clean(i["description"]),
-            "출처": format_source(i["link"].split("/")[2]),
-            "발행일": parse_date(i["pubDate"]).strftime("%Y-%m-%d") if parse_date(i["pubDate"]) else "",
-            "링크": i["link"]
+            "제목": clean(i.get("title", "")),
+            "요약": clean(i.get("description", "")),
+            "출처": format_source(domain) if domain else "News",
+            "발행일": pd_dt.strftime("%Y-%m-%d") if pd_dt else "",
+            "링크": link
         })
     return out
 
 # =====================
-# DBpia (예정)
+# DBpia 검색 (연동)
+# - 공식 검색 API: http://api.dbpia.co.kr/v2/search/search.xml
+# - 검색 파라미터: key, target=se 또는 se_adv, searchall 등
 # =====================
-def search_dbpia(keyword):
-    return pd.DataFrame(columns=["제목","저자","학술지","연도","링크"])
+def dbpia_request(params: dict) -> tuple[bool, str]:
+    """
+    return: (ok, xml_text_or_error_message)
+    """
+    url = "http://api.dbpia.co.kr/v2/search/search.xml"
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.encoding = "utf-8"
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}"
+        return True, r.text
+    except Exception as e:
+        return False, str(e)
+
+def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
+    """
+    DBpia 검색 API 응답(XML)을 DataFrame으로 변환
+    컬럼: 제목, 저자, 학술지, 연도, 발행일, 페이지, 링크, DBpiaID
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+
+    # 에러 체크(문서에 따라 error/code/message 구조가 다를 수 있어 방어적으로)
+    err = root.find(".//error")
+    if err is not None:
+        code = safe_get_text(err.find("code"), "")
+        msg = safe_get_text(err.find("message"), "DBpia API error")
+        return pd.DataFrame([{
+            "제목": "",
+            "저자": "",
+            "학술지": "",
+            "연도": "",
+            "발행일": "",
+            "페이지": "",
+            "링크": "",
+            "DBpiaID": f"{code}: {msg}"
+        }])
+
+    rows = []
+    for item in root.findall(".//item"):
+        title = safe_get_text(item.find("title"), "")
+
+        # authors: 여러 author child가 있을 수 있음
+        author_names = []
+        authors = item.find("authors")
+        if authors is not None:
+            for a in authors.findall("author"):
+                name = a.get("name") or safe_get_text(a.find("name"), "")
+                if name:
+                    author_names.append(name)
+        author_str = ", ".join(author_names) if author_names else ""
+
+        # publication (학술지/간행물)
+        pub_name = ""
+        publication = item.find("publication")
+        if publication is not None:
+            pub_name = publication.get("name") or safe_get_text(publication.find("name"), "")
+
+        # issue: 발행연월 등이 있을 수 있음 (yymm 등)
+        year = ""
+        pubdate = ""
+        issue = item.find("issue")
+        if issue is not None:
+            yymm = issue.get("yymm") or safe_get_text(issue.find("yymm"), "")
+            # yymm이 202401 같은 형식이면 연도만 추출
+            if yymm and len(yymm) >= 4 and yymm[:4].isdigit():
+                year = yymm[:4]
+                if len(yymm) >= 6 and yymm[4:6].isdigit():
+                    pubdate = f"{yymm[:4]}-{yymm[4:6]}"
+            # 발행일/발행년이 별도 있을 수도 있으니 보강
+            y = issue.get("year") or safe_get_text(issue.find("year"), "")
+            if (not year) and y and y.isdigit():
+                year = y
+
+        pages = safe_get_text(item.find("pages"), "")
+
+        link_url = safe_get_text(item.find("link_url"), "")
+        link_api = safe_get_text(item.find("link_api"), "")
+        # 가능하면 사람에게 유용한 상세 링크를 우선
+        link = link_url or link_api
+
+        # DBpia ID는 link_api에 포함될 때가 많아서 최대한 추출
+        dbpia_id = ""
+        if link_api:
+            m = re.search(r"[?&]id=([^&]+)", link_api)
+            if m:
+                dbpia_id = m.group(1)
+
+        rows.append({
+            "제목": title,
+            "저자": author_str,
+            "학술지": pub_name,
+            "연도": year,
+            "발행일": pubdate,  # YYYY-MM (가능할 때)
+            "페이지": pages,
+            "링크": link,
+            "DBpiaID": dbpia_id
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+    return df
+
+def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True) -> pd.DataFrame:
+    """
+    DBpia OpenAPI로 논문/학술자료 검색.
+    - target=se_adv : 상세검색
+    - itype=1 : 학술저널(논문) 중심
+    - sorttype=2 : 발행일순 (문서 기준)
+    """
+    if not dbpia_key:
+        return pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+
+    # DBpia는 pagecount 기본 20. max_results 초과는 페이지를 돌며 합치기.
+    per_page = 20
+    need = max(1, int(max_results))
+    pages = (need - 1) // per_page + 1
+
+    all_frames = []
+    for p in range(1, pages + 1):
+        params = {
+            "key": dbpia_key,
+            "target": "se_adv",
+            "searchall": keyword,
+            "itype": 1,                 # 1=학술저널
+            "pagecount": per_page,
+            "pagenumber": p,
+            "freeyn": "yes",
+            "priceyn": "no",
+        }
+        if sort_by_date:
+            params["sorttype"] = 2      # 2=발행일순
+            params["sortorder"] = "desc"
+
+        ok, xml_or_err = dbpia_request(params)
+        if not ok:
+            # 페이지 하나라도 실패하면 경고만 띄우고 진행 (기능 유지)
+            st.warning(f"DBpia API 호출 실패(p={p}): {xml_or_err}")
+            continue
+
+        df = parse_dbpia_xml(xml_or_err)
+        all_frames.append(df)
+
+    if not all_frames:
+        return pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+
+    out = pd.concat(all_frames, ignore_index=True)
+
+    # max_results 만큼 자르기 + 중복 제거(링크/제목 기준)
+    if "링크" in out.columns:
+        out = out.drop_duplicates(subset=["링크"], keep="first")
+    out = out.head(need)
+    return out
 
 # =====================
 # 실행
@@ -183,7 +367,10 @@ if st.button("🔍 리서치 시작") and topic:
             filtered = news_list_sorted[:10]
 
         news_df = pd.DataFrame(filtered).drop_duplicates(subset=["링크"])
-        paper_df = search_dbpia(topic)
+
+        # ✅ DBpia 연동 (모드가 연구논문용이면 더 많이, 아니면 기본 20)
+        paper_limit = 40 if mode == "📚 연구논문용 모드" else 20
+        paper_df = search_dbpia(topic, max_results=paper_limit, sort_by_date=True)
 
         st.session_state.results = {
             "topic": topic,
@@ -230,7 +417,7 @@ if st.session_state.results:
     st.subheader("📈 연구 동향")
     st.markdown(r["trend"])
 
-    tab_news, tab_paper = st.tabs(["📰 뉴스", "📄 논문 (DBpia 예정)"])
+    tab_news, tab_paper = st.tabs(["📰 뉴스", "📄 논문 (DBpia)"])
 
     with tab_news:
         sort = st.radio("정렬 기준", ["관련도순", "최신순"], horizontal=True)
@@ -252,8 +439,15 @@ if st.session_state.results:
             st.markdown(f"- {apa_news(row)}")
 
     with tab_paper:
-        st.info("DBpia 연동 예정 영역입니다.")
-        st.dataframe(r["papers"], use_container_width=True)
+        if not dbpia_key:
+            st.info("DBpia API Key를 입력하면 논문 검색 결과가 표시됩니다. (사이드바 → DBpia 설정)")
+        dfp = r["papers"].copy() if isinstance(r.get("papers"), pd.DataFrame) else pd.DataFrame(r.get("papers", []))
+
+        st.dataframe(dfp, use_container_width=True)
+
+        if not dfp.empty:
+            csv_papers = dfp.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 논문 CSV 다운로드", csv_papers, f"{slugify(r['topic'])}_papers_dbpia.csv")
 
 # =====================
 # 히스토리 (에러 방지 구조)
@@ -266,9 +460,8 @@ if os.path.exists("history"):
         with st.sidebar.expander(f"📅 {d}"):
             files = os.listdir(f"history/{d}")
             for f in files:
-                label = pretty(f.replace(".json",""))
+                label = pretty(f.replace(".json", ""))
                 if st.button(label, key=f"{d}_{f}"):
-
                     file_path = f"history/{d}/{f}"
 
                     try:
@@ -280,6 +473,6 @@ if os.path.exists("history"):
                         st.session_state.results = data
 
                     except json.JSONDecodeError:
-                        st.sidebar.warning(f"⚠️ 손상된 파일 스킵됨: {pretty(f.replace('.json',''))}")
+                        st.sidebar.warning(f"⚠️ 손상된 파일 스킵됨: {pretty(f.replace('.json', ''))}")
                     except Exception:
-                        st.sidebar.warning(f"⚠️ 파일 로딩 실패: {pretty(f.replace('.json',''))}")
+                        st.sidebar.warning(f"⚠️ 파일 로딩 실패: {pretty(f.replace('.json', ''))}")
