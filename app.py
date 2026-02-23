@@ -19,14 +19,13 @@ if "results" not in st.session_state:
     st.session_state.results = None
 
 # =====================
-# API
+# API 입력
 # =====================
 st.sidebar.header("🔑 API 설정")
 openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
 naver_id = st.sidebar.text_input("Naver Client ID", type="password")
 naver_secret = st.sidebar.text_input("Naver Client Secret", type="password")
 
-# ✅ DBpia (추가)
 st.sidebar.markdown("---")
 st.sidebar.subheader("📄 DBpia 설정 (선택)")
 dbpia_key = st.sidebar.text_input("DBpia OpenAPI Key", type="password")
@@ -49,8 +48,20 @@ st.sidebar.subheader("🌐 실행환경 네트워크")
 st.sidebar.write("Public IP:", get_public_ip())
 st.sidebar.caption("DBpia 키가 IP 제한(E0014)인 경우, 여기 나온 Public IP를 DBpia 키 설정에 등록해야 합니다.")
 
+# =====================
+# DBpia 검색 범위 옵션
+# =====================
+st.sidebar.markdown("---")
+st.sidebar.subheader("📌 DBpia 검색 범위")
+dbpia_scope = st.sidebar.radio("자료유형", ["학술저널(논문)만", "확장(학술대회/보고서 포함)"])
+DBPIA_ITYPES = [1] if dbpia_scope == "학술저널(논문)만" else [1, 2, 4]
+st.sidebar.caption("확장 검색은 결과가 늘어날 수 있어요. (1=학술저널, 2=학술대회자료, 4=연구보고서)")
+
+# =====================
+# OpenAI / Naver 키 필수
+# =====================
 if not openai_key or not naver_id or not naver_secret:
-    st.warning("⬅️ 사이드바에 모든 API 키를 입력하세요.")
+    st.warning("⬅️ 사이드바에 모든 API 키(OpenAI/Naver)를 입력하세요.")
     st.stop()
 
 client = OpenAI(api_key=openai_key)
@@ -75,6 +86,20 @@ MODE_CONFIG = {
 # =====================
 def clean(t: str) -> str:
     return html.unescape(t).replace("<b>", "").replace("</b>", "").strip()
+
+def strip_dbpia_markup(text: str) -> str:
+    """
+    DBpia 검색 결과에 끼는 하이라이트/마크업 제거:
+    - <!HS>면역<!HE>
+    - &lt;!HS&gt;...&lt;!HE&gt; (escape)
+    """
+    if not text:
+        return ""
+    t = html.unescape(text)  # &lt;!HS&gt; -> <!HS>
+    t = t.replace("<!HS>", "").replace("<!HE>", "")
+    t = re.sub(r"<!H[SE]>", "", t)  # 방어적
+    t = t.replace("<b>", "").replace("</b>", "")
+    return t.strip()
 
 def parse_date(d: str):
     try:
@@ -107,8 +132,7 @@ def safe_int(x, default=0):
 
 def normalize_pages(pages: str) -> tuple[str, str]:
     """
-    DBpia pages 예: "279-309 (31 pages)" / "37-50 (14 pages)" / "279-309"
-    return: (start_page, end_page) 없으면 ("","")
+    pages 예: "199-210 (12 pages)" / "279-309" -> ("199","210")
     """
     if not pages:
         return "", ""
@@ -118,12 +142,6 @@ def normalize_pages(pages: str) -> tuple[str, str]:
     return "", ""
 
 def format_authors_apa_kor(authors_str: str) -> str:
-    """
-    아주 단순한 APA 저자 포맷:
-    - "김철수, 이영희" -> "김철수, 이영희"
-    DBpia는 보통 '성명'을 이미 정리해서 주기 때문에 큰 변환은 하지 않음.
-    (원하면: 3명 이상일 때 et al. 처리 등 확장 가능)
-    """
     s = (authors_str or "").strip()
     return s if s else "Unknown"
 
@@ -137,22 +155,13 @@ def apa_news(row):
 
 def apa_paper(row):
     """
-    DBpia 논문 APA7 (업그레이드 버전)
-    가능한 필드(검색 API 기준):
-    - 저자
-    - 연도(또는 발행일 YYYY-MM)
-    - 제목
-    - 학술지(publication name)
-    - 권(volume = issue.range 또는 issue.num 등에 들어올 수 있음)
-    - 호(issue = issue.name 또는 issue.num)
-    - 페이지(시작-끝)
-    - DOI (DBpia 검색 API에 직접 필드가 없는 경우가 많아, link/문자열에서 추출 시도만)
+    논문 APA7 (가능한 필드로 최대한 정확히)
+    - 저자. (연도). 제목. 학술지, 권(호), 시작–끝. DOI or URL
     """
     authors = format_authors_apa_kor(row.get("저자", ""))
-    title = (row.get("제목", "") or "").strip()
-    journal = (row.get("학술지", "") or "DBpia").strip()
+    title = strip_dbpia_markup(row.get("제목", "") or "")
+    journal = strip_dbpia_markup(row.get("학술지", "") or "DBpia")
 
-    # 연도 우선, 없으면 발행일 YYYY-MM에서 연도 추출
     year = (row.get("연도", "") or "").strip()
     if not year:
         pub = (row.get("발행일", "") or "").strip()
@@ -161,64 +170,39 @@ def apa_paper(row):
     if not year:
         year = "n.d."
 
-    # 권/호
     volume = (row.get("권", "") or "").strip()
     issue_no = (row.get("호", "") or "").strip()
 
-    # 페이지
-    pages_raw = (row.get("페이지", "") or "").strip()
+    pages_raw = strip_dbpia_markup(row.get("페이지", "") or "")
     sp, ep = normalize_pages(pages_raw)
-    pages_part = ""
-    if sp and ep:
-        pages_part = f"{sp}–{ep}"
-    elif pages_raw:
-        pages_part = pages_raw
+    pages_part = f"{sp}–{ep}" if sp and ep else (pages_raw if pages_raw else "")
 
-    # DOI 추출(있을 때만) - DBpia 검색 API에 DOI 필드가 없을 수 있어 heuristic
     doi = (row.get("DOI", "") or "").strip()
-    if not doi:
-        # 링크나 기타 필드에 DOI 패턴이 있으면 잡기 (가능하면)
-        for cand in [row.get("링크", ""), row.get("link_api", ""), row.get("link_url", "")]:
-            if not cand:
-                continue
-            m = re.search(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", str(cand), flags=re.I)
-            if m:
-                doi = m.group(1)
-                break
-
     url = (row.get("링크", "") or "").strip()
 
-    # ---- APA 구성 ----
-    # Journal, volume(issue), pages.
     vol_issue = ""
     if volume and issue_no:
         vol_issue = f"{volume}({issue_no})"
     elif volume:
         vol_issue = volume
     elif issue_no:
-        # 권이 없고 호만 있으면 (드물지만) 호만 표시
         vol_issue = f"({issue_no})"
 
-    parts = []
-    parts.append(f"{authors}. ({year}). {title}. {journal}")
-
+    s = f"{authors}. ({year}). {title}. {journal}"
     if vol_issue:
-        parts[-1] = parts[-1] + f", {vol_issue}"
+        s += f", {vol_issue}"
     if pages_part:
-        parts[-1] = parts[-1] + f", {pages_part}"
+        s += f", {pages_part}"
+    s += "."
 
-    parts[-1] = parts[-1] + "."
-
-    # DOI가 있으면 DOI 우선, 없으면 URL
     if doi:
-        parts.append(f"https://doi.org/{doi}")
-    elif url:
-        parts.append(url)
-
-    return " ".join(parts)
+        return s + f" https://doi.org/{doi}"
+    if url:
+        return s + f" {url}"
+    return s
 
 # =====================
-# AI
+# AI (질문/키워드/요약/관련도)
 # =====================
 def gen_questions(topic):
     prompt = f"다음 주제에 대한 연구 질문 3개 생성:\n{topic}"
@@ -247,7 +231,7 @@ def gen_trend_summary(keywords):
     )
     return r.choices[0].message.content.strip()
 
-def relevance(topic, n):
+def relevance_news(topic, n):
     prompt = f"""
 연구 주제: {topic}
 뉴스 제목: {n['제목']}
@@ -318,7 +302,7 @@ def search_news(q):
     return out
 
 # =====================
-# DBpia 검색 (디버그 포함 + 권/호 파싱 강화)
+# DBpia 검색 (권/호 파싱 + 멀티쿼리 + 디버그)
 # =====================
 DBPIA_BASE_URLS = [
     "http://api.dbpia.co.kr/v2/search/search.xml",
@@ -330,7 +314,6 @@ def dbpia_request(params: dict) -> tuple[bool, str]:
         "User-Agent": "RefNoteAI/1.0 (+streamlit)",
         "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
     }
-
     last_err = None
     for url in DBPIA_BASE_URLS:
         try:
@@ -346,7 +329,6 @@ def dbpia_request(params: dict) -> tuple[bool, str]:
             return True, text
         except Exception as e:
             last_err = str(e)
-
     return False, last_err or "Unknown request error"
 
 def extract_dbpia_error(xml_text: str) -> tuple[str, str]:
@@ -354,25 +336,18 @@ def extract_dbpia_error(xml_text: str) -> tuple[str, str]:
         root = ET.fromstring(xml_text)
     except Exception:
         return "", ""
-
     err = root.find(".//error")
     if err is not None:
         code = safe_get_text(err.find("code"), "")
         msg = safe_get_text(err.find("message"), "")
         return code, msg
-
     code = safe_get_text(root.find(".//code"), "")
     msg = safe_get_text(root.find(".//message"), "")
     if code or msg:
         return code, msg
-
     return "", ""
 
 def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
-    """
-    컬럼 확장:
-    - 권, 호, DOI (가능하면)
-    """
     base_cols = ["제목", "저자", "학술지", "연도", "발행일", "권", "호", "페이지", "DOI", "링크", "DBpiaID"]
 
     code, msg = extract_dbpia_error(xml_text)
@@ -400,8 +375,9 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
 
     rows = []
     for item in root.findall(".//item"):
-        title = safe_get_text(item.find("title"), "")
+        title = strip_dbpia_markup(safe_get_text(item.find("title"), ""))
 
+        # 저자들
         author_names = []
         authors = item.find("authors")
         if authors is not None:
@@ -411,89 +387,66 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
                     author_names.append(name)
         author_str = ", ".join(author_names) if author_names else ""
 
+        # 학술지명
         pub_name = ""
         publication = item.find("publication")
         if publication is not None:
             pub_name = publication.get("name") or safe_get_text(publication.find("name"), "")
+        pub_name = strip_dbpia_markup(pub_name)
 
         # issue 파싱 강화
         year = ""
         pubdate = ""
-        vol = ""   # 권
-        iss = ""   # 호
+        vol = ""
+        iss = ""
 
         issue = item.find("issue")
         if issue is not None:
-            # 문서 설명 기준:
-            # - issue 하위요소: range(권호범위), name(권호명), num(권(호)), yymm(발행연월)
-            # 실제 응답은 attribute로 올 수도 있고 child로 올 수도 있어서 둘 다 대비
             yymm = issue.get("yymm") or safe_get_text(issue.find("yymm"), "")
-            if yymm and len(yymm) >= 4 and yymm[:4].isdigit():
-                year = yymm[:4]
-                if len(yymm) >= 6 and yymm[4:6].isdigit():
-                    pubdate = f"{yymm[:4]}-{yymm[4:6]}"
+            yymm = (yymm or "").strip()
+            if yymm:
+                m = re.search(r"(\d{4})\D+(\d{1,2})", yymm)
+                if m:
+                    year = m.group(1)
+                    month = m.group(2).zfill(2)
+                    pubdate = f"{year}-{month}"
+                elif len(yymm) >= 4 and yymm[:4].isdigit():
+                    year = yymm[:4]
 
-            y = issue.get("year") or safe_get_text(issue.find("year"), "")
-            if (not year) and y and y.isdigit():
-                year = y
-
-            # 권/호 후보들
-            # 1) num = 권(호) (예: "5(1)" or "61" 같은 형태)
             num = issue.get("num") or safe_get_text(issue.find("num"), "")
             if num:
-                m = re.match(r"^\s*(\d+)\s*\(\s*(\d+)\s*\)\s*$", num)
+                num = num.strip()
+                m = re.match(r"^(\d+)\s*\(\s*(\d+)\s*\)$", num)
                 if m:
                     vol, iss = m.group(1), m.group(2)
                 else:
-                    # 그냥 권만 들어온 경우로 처리
-                    if num.strip().isdigit():
-                        vol = num.strip()
-                    else:
-                        # "61, 1" 같은 이상 케이스
-                        m2 = re.search(r"(\d+)\s*\(\s*(\d+)\s*\)", num)
-                        if m2:
-                            vol, iss = m2.group(1), m2.group(2)
+                    if num.isdigit():
+                        vol = num
 
-            # 2) name = 권호명에 "61" 또는 "61권 1호" 같은 텍스트가 올 수 있음
             name = issue.get("name") or safe_get_text(issue.find("name"), "")
-            if name and (not vol and not iss):
-                # 숫자(숫자) 패턴
-                m = re.search(r"(\d+)\s*\(\s*(\d+)\s*\)", name)
-                if m:
-                    vol, iss = m.group(1), m.group(2)
-                else:
-                    # "61권 1호" 같은 형태
-                    m2 = re.search(r"(\d+)\s*권.*?(\d+)\s*호", name)
-                    if m2:
-                        vol, iss = m2.group(1), m2.group(2)
-                    else:
-                        # 숫자만 있으면 권으로
-                        m3 = re.search(r"\b(\d+)\b", name)
-                        if m3:
-                            vol = vol or m3.group(1)
+            name = (name or "").strip()
+            if name and (not vol or not iss):
+                m2 = re.search(r"제?\s*(\d+)\s*권", name)
+                m3 = re.search(r"제?\s*(\d+)\s*호", name)
+                if m2 and not vol:
+                    vol = m2.group(1)
+                if m3 and not iss:
+                    iss = m3.group(1)
 
-            # 3) range는 간행물일 때 권호범위일 수 있으나, 혹시라도 있으면 백업
-            rng = issue.get("range") or safe_get_text(issue.find("range"), "")
-            # range는 보통 "1~10" 같은 범위라 권/호로 쓰기 애매해서 여기선 저장하지 않음
-
-        pages = safe_get_text(item.find("pages"), "")
+        pages = strip_dbpia_markup(safe_get_text(item.find("pages"), ""))
 
         link_url = safe_get_text(item.find("link_url"), "")
         link_api = safe_get_text(item.find("link_api"), "")
         link = link_url or link_api
 
-        # DBpia ID
         dbpia_id = ""
         if link_api:
             m = re.search(r"[?&]id=([^&]+)", link_api)
             if m:
                 dbpia_id = m.group(1)
 
-        # DOI (검색 API에 직접 필드가 없을 수 있어, item 내부 텍스트/속성에서 탐색)
-        doi = ""
-        # 1) 혹시 doi 태그가 있으면
         doi = safe_get_text(item.find("doi"), "") or safe_get_text(item.find("DOI"), "")
-        # 2) 없으면 link나 내부 텍스트에서 heuristic
+        doi = (doi or "").strip()
         if not doi:
             for cand in [link_api, link_url, title]:
                 if not cand:
@@ -522,9 +475,8 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
         df = pd.DataFrame(columns=base_cols)
     return df
 
-def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True) -> pd.DataFrame:
+def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True, itype: int = 1) -> pd.DataFrame:
     base_cols = ["제목", "저자", "학술지", "연도", "발행일", "권", "호", "페이지", "DOI", "링크", "DBpiaID"]
-
     if not dbpia_key:
         return pd.DataFrame(columns=base_cols)
 
@@ -538,7 +490,7 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
             "key": dbpia_key,
             "target": "se_adv",
             "searchall": keyword,
-            "itype": 1,
+            "itype": itype,
             "pagecount": per_page,
             "pagenumber": p,
             "freeyn": "yes",
@@ -550,8 +502,7 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
 
         ok, xml_or_err = dbpia_request(params)
 
-        # ✅ 디버그 expander
-        with st.expander(f"🧪 DBpia debug (page={p})", expanded=False):
+        with st.expander(f"🧪 DBpia debug (q='{keyword}' / itype={itype} / page={p})", expanded=False):
             st.write("request params:", params)
             if ok:
                 code, msg = extract_dbpia_error(xml_or_err)
@@ -562,7 +513,7 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
                 st.write("request failed:", xml_or_err)
 
         if not ok:
-            st.warning(f"DBpia API 호출 실패(p={p}): {xml_or_err}")
+            st.warning(f"DBpia API 호출 실패(q={keyword}, itype={itype}, p={p}): {xml_or_err}")
             continue
 
         df = parse_dbpia_xml(xml_or_err)
@@ -573,7 +524,6 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
 
     out = pd.concat(all_frames, ignore_index=True)
 
-    # 에러 행 제거(정상행이 있을 때만)
     if "DBpiaID" in out.columns:
         err_mask = out["DBpiaID"].astype(str).str.match(r"^E\d{4}\s*:")
         if err_mask.any() and (~err_mask).any():
@@ -581,7 +531,56 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
 
     if "링크" in out.columns:
         out = out.drop_duplicates(subset=["링크"], keep="first")
+
     out = out.head(need)
+    return out
+
+def build_dbpia_queries(topic: str, keywords: list[str]) -> list[str]:
+    kws = [k.strip() for k in (keywords or []) if k and k.strip()]
+    kws = list(dict.fromkeys(kws))
+
+    queries = []
+    if topic and topic.strip():
+        queries.append(topic.strip())
+
+    if len(kws) >= 2:
+        queries.append(" ".join(kws[:2]))
+    if len(kws) >= 3:
+        queries.append(" ".join(kws[:3]))
+
+    queries.extend(kws[:5])
+    return list(dict.fromkeys([q for q in queries if q]))[:6]
+
+def search_dbpia_multi(topic: str, keywords: list[str], max_results: int = 30, sort_by_date: bool = True,
+                       itypes: list[int] | None = None) -> pd.DataFrame:
+    base_cols = ["제목", "저자", "학술지", "연도", "발행일", "권", "호", "페이지", "DOI", "링크", "DBpiaID"]
+    if not dbpia_key:
+        return pd.DataFrame(columns=base_cols)
+
+    if itypes is None:
+        itypes = [1]
+
+    queries = build_dbpia_queries(topic, keywords)
+    frames = []
+    per_query_need = max(10, max_results // max(1, (len(queries) * len(itypes))))
+
+    for q in queries:
+        for it in itypes:
+            df = search_dbpia(q, max_results=per_query_need, sort_by_date=sort_by_date, itype=it)
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=base_cols)
+
+    out = pd.concat(frames, ignore_index=True)
+
+    if "링크" in out.columns:
+        out = out.drop_duplicates(subset=["링크"], keep="first")
+    else:
+        out = out.drop_duplicates(subset=["제목", "저자", "학술지"], keep="first")
+
+    out = out[out["제목"].astype(str).str.strip() != ""].copy()
+    out = out.head(max_results)
     return out
 
 # =====================
@@ -605,7 +604,7 @@ if st.button("🔍 리서치 시작") and topic:
 
         filtered = []
         for n in news_list:
-            n["score"] = relevance(topic, n)
+            n["score"] = relevance_news(topic, n)
             if n["score"] >= cfg["threshold"]:
                 filtered.append(n)
 
@@ -617,9 +616,12 @@ if st.button("🔍 리서치 시작") and topic:
 
         # ---- 논문(DBpia) ----
         paper_limit = 40 if mode == "📚 연구논문용 모드" else 20
-        paper_df = search_dbpia(topic, max_results=paper_limit, sort_by_date=True)
 
-        # ✅ 논문 관련도 점수 부여
+        paper_df = search_dbpia_multi(topic, keywords, max_results=paper_limit, sort_by_date=True, itypes=DBPIA_ITYPES)
+
+        if paper_df.empty and keywords:
+            paper_df = search_dbpia_multi(keywords[0], keywords, max_results=paper_limit, sort_by_date=True, itypes=DBPIA_ITYPES)
+
         if not paper_df.empty:
             papers_records = paper_df.to_dict(orient="records")
             scored = []
@@ -715,8 +717,7 @@ if st.session_state.results:
                     dfp["score"] = dfp["score"].apply(lambda x: safe_int(x, 0))
                     dfp = dfp.sort_values(by="score", ascending=False)
             else:
-                # 발행일(YYYY-MM) 우선, 없으면 연도
-                if "발행일" in dfp.columns:
+                if "발행일" in dfp.columns and dfp["발행일"].notna().any():
                     dfp = dfp.sort_values(by="발행일", ascending=False)
                 elif "연도" in dfp.columns:
                     dfp = dfp.sort_values(by="연도", ascending=False)
