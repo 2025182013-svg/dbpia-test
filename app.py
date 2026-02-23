@@ -35,6 +35,20 @@ st.sidebar.caption(
     "원문 제공은 별도 계약/권한이 필요할 수 있어요."
 )
 
+# =====================
+# 실행환경 네트워크(공인 IP 확인)
+# =====================
+def get_public_ip():
+    try:
+        return requests.get("https://api.ipify.org", timeout=10).text.strip()
+    except:
+        return "unknown"
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🌐 실행환경 네트워크")
+st.sidebar.write("Public IP:", get_public_ip())
+st.sidebar.caption("DBpia 키가 IP 제한(E0014)인 경우, 여기 나온 Public IP를 DBpia 키 설정에 등록해야 합니다.")
+
 if not openai_key or not naver_id or not naver_secret:
     st.warning("⬅️ 사이드바에 모든 API 키를 입력하세요.")
     st.stop()
@@ -176,15 +190,11 @@ def search_news(q):
     return out
 
 # =====================
-# DBpia 검색 (수정/강화)
-# - 공식 검색 API: http://api.dbpia.co.kr/v2/search/search.xml
-# - 필수: key, target, (searchall 또는 searchauthor/searchbook/searchpublisher 중 하나 이상)
-# - sortorder는 sorttype=2(발행일순)일 때만 지정
-# - 키/IP/OS 제한 에러를 사용자에게 "코드+메시지"로 보여주기
+# DBpia 검색 (디버그 포함)
 # =====================
 DBPIA_BASE_URLS = [
     "http://api.dbpia.co.kr/v2/search/search.xml",
-    "https://api.dbpia.co.kr/v2/search/search.xml",  # 혹시 https가 열려 있으면 자동 대체
+    "https://api.dbpia.co.kr/v2/search/search.xml",  # https 지원시 자동 대체
 ]
 
 def dbpia_request(params: dict) -> tuple[bool, str]:
@@ -204,9 +214,7 @@ def dbpia_request(params: dict) -> tuple[bool, str]:
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
                 continue
-
             text = (r.text or "").strip()
-            # XML이 아니면(가끔 HTML 에러 페이지 등) 방어
             if not text.startswith("<"):
                 last_err = "Non-XML response"
                 continue
@@ -217,23 +225,17 @@ def dbpia_request(params: dict) -> tuple[bool, str]:
     return False, last_err or "Unknown request error"
 
 def extract_dbpia_error(xml_text: str) -> tuple[str, str]:
-    """
-    DBpia 에러가 XML로 올 때 code/message를 최대한 찾아 반환.
-    없으면 ("", "")
-    """
     try:
         root = ET.fromstring(xml_text)
     except Exception:
         return "", ""
 
-    # 문서마다 위치가 조금 달라도 .//error로 최대한 탐색
     err = root.find(".//error")
     if err is not None:
         code = safe_get_text(err.find("code"), "")
         msg = safe_get_text(err.find("message"), "")
         return code, msg
 
-    # 혹시 다른 태그명을 쓰는 경우를 대비(있을 수도 있음)
     code = safe_get_text(root.find(".//code"), "")
     msg = safe_get_text(root.find(".//message"), "")
     if code or msg:
@@ -242,19 +244,15 @@ def extract_dbpia_error(xml_text: str) -> tuple[str, str]:
     return "", ""
 
 def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
-    """
-    DBpia 검색 API 응답(XML)을 DataFrame으로 변환
-    컬럼: 제목, 저자, 학술지, 연도, 발행일, 페이지, 링크, DBpiaID
-    """
     base_cols = ["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"]
 
-    # 에러 먼저 체크
     code, msg = extract_dbpia_error(xml_text)
     if code or msg:
-        # "결과 없음(E0016)"은 빈 결과로 취급
+        # E0016: 결과 없음 → 빈 DF
         if code == "E0016":
             return pd.DataFrame(columns=base_cols)
 
+        # 그 외 에러는 한 줄로 표시(디버그 목적)
         return pd.DataFrame([{
             "제목": "",
             "저자": "",
@@ -275,7 +273,6 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
     for item in root.findall(".//item"):
         title = safe_get_text(item.find("title"), "")
 
-        # authors: 여러 author child가 있을 수 있음
         author_names = []
         authors = item.find("authors")
         if authors is not None:
@@ -285,13 +282,11 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
                     author_names.append(name)
         author_str = ", ".join(author_names) if author_names else ""
 
-        # publication (학술지/간행물)
         pub_name = ""
         publication = item.find("publication")
         if publication is not None:
             pub_name = publication.get("name") or safe_get_text(publication.find("name"), "")
 
-        # issue: 발행연월 등이 있을 수 있음 (yymm 등)
         year = ""
         pubdate = ""
         issue = item.find("issue")
@@ -322,7 +317,7 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
             "저자": author_str,
             "학술지": pub_name,
             "연도": year,
-            "발행일": pubdate,  # YYYY-MM (가능할 때)
+            "발행일": pubdate,
             "페이지": pages,
             "링크": link,
             "DBpiaID": dbpia_id
@@ -334,13 +329,6 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
     return df
 
 def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True) -> pd.DataFrame:
-    """
-    DBpia OpenAPI로 논문/학술자료 검색.
-    - target=se_adv : 상세검색
-    - itype=1 : 학술저널(논문) 중심
-    - sorttype=2 : 발행일순
-    - sortorder=desc : 발행일순에서만 사용(문서 안내)
-    """
     base_cols = ["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"]
 
     if not dbpia_key:
@@ -352,38 +340,38 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
 
     all_frames = []
     for p in range(1, pages + 1):
-        # ✅ 필수: key, target, (searchall 등 최소 1개)
         params = {
             "key": dbpia_key,
-            "target": "se_adv",        # 상세검색
-            "searchall": keyword,      # 최소 1개 필수
-            "itype": 1,                # 1=학술저널
+            "target": "se_adv",
+            "searchall": keyword,
+            "itype": 1,               # 1=학술저널
             "pagecount": per_page,
             "pagenumber": p,
             "freeyn": "yes",
             "priceyn": "no",
         }
-
-        # ✅ 발행일순 정렬 + (발행일순에서만 sortorder 허용)
         if sort_by_date:
             params["sorttype"] = 2     # 2=발행일순
             params["sortorder"] = "desc"
 
         ok, xml_or_err = dbpia_request(params)
+
+        # ✅ 디버그: 요청/응답/에러코드를 접어서 보여줌
+        with st.expander(f"🧪 DBpia debug (page={p})", expanded=False):
+            st.write("request params:", params)
+            if ok:
+                code, msg = extract_dbpia_error(xml_or_err)
+                st.write("error code:", code)
+                st.write("error msg:", msg)
+                st.text(xml_or_err[:1500])  # 길면 앞부분만
+            else:
+                st.write("request failed:", xml_or_err)
+
         if not ok:
             st.warning(f"DBpia API 호출 실패(p={p}): {xml_or_err}")
             continue
 
-        # ✅ 에러 코드/메시지를 화면에 보여주기 (원인 파악용)
-        code, msg = extract_dbpia_error(xml_or_err)
-        if code or msg:
-            # 결과 없음(E0016)은 조용히 처리
-            if code != "E0016":
-                st.warning(f"DBpia API error(p={p}) → {code}: {msg}")
-            df = parse_dbpia_xml(xml_or_err)
-        else:
-            df = parse_dbpia_xml(xml_or_err)
-
+        df = parse_dbpia_xml(xml_or_err)
         all_frames.append(df)
 
     if not all_frames:
@@ -391,16 +379,12 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
 
     out = pd.concat(all_frames, ignore_index=True)
 
-    # 만약 에러가 DataFrame로 들어온 경우(제목 공백 + DBpiaID에 code:msg),
-    # 그 한 줄만 남는 걸 방지하고, 에러 행은 별도로 걸러내기(원하면 유지 가능)
+    # 에러 행(예: "E0014: ...")이 섞였는데 정상행도 있으면 에러행 제거
     if "DBpiaID" in out.columns:
-        # "E####:" 형태면 에러로 간주
         err_mask = out["DBpiaID"].astype(str).str.match(r"^E\d{4}\s*:")
-        # 에러 행이 있고, 정상행도 있으면 에러행 제거
         if err_mask.any() and (~err_mask).any():
             out = out.loc[~err_mask].copy()
 
-    # 중복 제거 + 자르기
     if "링크" in out.columns:
         out = out.drop_duplicates(subset=["링크"], keep="first")
     out = out.head(need)
@@ -438,7 +422,7 @@ if st.button("🔍 리서치 시작") and topic:
 
         news_df = pd.DataFrame(filtered).drop_duplicates(subset=["링크"])
 
-        # ✅ DBpia 연동 (모드가 연구논문용이면 더 많이, 아니면 기본 20)
+        # ✅ DBpia 연동
         paper_limit = 40 if mode == "📚 연구논문용 모드" else 20
         paper_df = search_dbpia(topic, max_results=paper_limit, sort_by_date=True)
 
@@ -511,8 +495,8 @@ if st.session_state.results:
     with tab_paper:
         if not dbpia_key:
             st.info("DBpia API Key를 입력하면 논문 검색 결과가 표시됩니다. (사이드바 → DBpia 설정)")
-        dfp = r["papers"].copy() if isinstance(r.get("papers"), pd.DataFrame) else pd.DataFrame(r.get("papers", []))
 
+        dfp = r["papers"].copy() if isinstance(r.get("papers"), pd.DataFrame) else pd.DataFrame(r.get("papers", []))
         st.dataframe(dfp, use_container_width=True)
 
         if not dfp.empty:
