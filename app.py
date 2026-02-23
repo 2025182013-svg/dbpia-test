@@ -32,7 +32,7 @@ st.sidebar.subheader("📄 DBpia 설정 (선택)")
 dbpia_key = st.sidebar.text_input("DBpia OpenAPI Key", type="password")
 st.sidebar.caption(
     "DBpia OpenAPI에서 **검색 API 키**를 발급받아 입력하세요. "
-    "원문 제공은 별도 계약이 필요할 수 있어요."
+    "원문 제공은 별도 계약/권한이 필요할 수 있어요."
 )
 
 if not openai_key or not naver_id or not naver_secret:
@@ -176,39 +176,85 @@ def search_news(q):
     return out
 
 # =====================
-# DBpia 검색 (연동)
+# DBpia 검색 (수정/강화)
 # - 공식 검색 API: http://api.dbpia.co.kr/v2/search/search.xml
-# - 검색 파라미터: key, target=se 또는 se_adv, searchall 등
+# - 필수: key, target, (searchall 또는 searchauthor/searchbook/searchpublisher 중 하나 이상)
+# - sortorder는 sorttype=2(발행일순)일 때만 지정
+# - 키/IP/OS 제한 에러를 사용자에게 "코드+메시지"로 보여주기
 # =====================
+DBPIA_BASE_URLS = [
+    "http://api.dbpia.co.kr/v2/search/search.xml",
+    "https://api.dbpia.co.kr/v2/search/search.xml",  # 혹시 https가 열려 있으면 자동 대체
+]
+
 def dbpia_request(params: dict) -> tuple[bool, str]:
     """
     return: (ok, xml_text_or_error_message)
     """
-    url = "http://api.dbpia.co.kr/v2/search/search.xml"
+    headers = {
+        "User-Agent": "RefNoteAI/1.0 (+streamlit)",
+        "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+    }
+
+    last_err = None
+    for url in DBPIA_BASE_URLS:
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=20)
+            r.encoding = "utf-8"
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+
+            text = (r.text or "").strip()
+            # XML이 아니면(가끔 HTML 에러 페이지 등) 방어
+            if not text.startswith("<"):
+                last_err = "Non-XML response"
+                continue
+            return True, text
+        except Exception as e:
+            last_err = str(e)
+
+    return False, last_err or "Unknown request error"
+
+def extract_dbpia_error(xml_text: str) -> tuple[str, str]:
+    """
+    DBpia 에러가 XML로 올 때 code/message를 최대한 찾아 반환.
+    없으면 ("", "")
+    """
     try:
-        r = requests.get(url, params=params, timeout=20)
-        r.encoding = "utf-8"
-        if r.status_code != 200:
-            return False, f"HTTP {r.status_code}"
-        return True, r.text
-    except Exception as e:
-        return False, str(e)
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return "", ""
+
+    # 문서마다 위치가 조금 달라도 .//error로 최대한 탐색
+    err = root.find(".//error")
+    if err is not None:
+        code = safe_get_text(err.find("code"), "")
+        msg = safe_get_text(err.find("message"), "")
+        return code, msg
+
+    # 혹시 다른 태그명을 쓰는 경우를 대비(있을 수도 있음)
+    code = safe_get_text(root.find(".//code"), "")
+    msg = safe_get_text(root.find(".//message"), "")
+    if code or msg:
+        return code, msg
+
+    return "", ""
 
 def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
     """
     DBpia 검색 API 응답(XML)을 DataFrame으로 변환
     컬럼: 제목, 저자, 학술지, 연도, 발행일, 페이지, 링크, DBpiaID
     """
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+    base_cols = ["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"]
 
-    # 에러 체크(문서에 따라 error/code/message 구조가 다를 수 있어 방어적으로)
-    err = root.find(".//error")
-    if err is not None:
-        code = safe_get_text(err.find("code"), "")
-        msg = safe_get_text(err.find("message"), "DBpia API error")
+    # 에러 먼저 체크
+    code, msg = extract_dbpia_error(xml_text)
+    if code or msg:
+        # "결과 없음(E0016)"은 빈 결과로 취급
+        if code == "E0016":
+            return pd.DataFrame(columns=base_cols)
+
         return pd.DataFrame([{
             "제목": "",
             "저자": "",
@@ -217,8 +263,13 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
             "발행일": "",
             "페이지": "",
             "링크": "",
-            "DBpiaID": f"{code}: {msg}"
-        }])
+            "DBpiaID": f"{code}: {msg}".strip(": ")
+        }], columns=base_cols)
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return pd.DataFrame(columns=base_cols)
 
     rows = []
     for item in root.findall(".//item"):
@@ -246,12 +297,10 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
         issue = item.find("issue")
         if issue is not None:
             yymm = issue.get("yymm") or safe_get_text(issue.find("yymm"), "")
-            # yymm이 202401 같은 형식이면 연도만 추출
             if yymm and len(yymm) >= 4 and yymm[:4].isdigit():
                 year = yymm[:4]
                 if len(yymm) >= 6 and yymm[4:6].isdigit():
                     pubdate = f"{yymm[:4]}-{yymm[4:6]}"
-            # 발행일/발행년이 별도 있을 수도 있으니 보강
             y = issue.get("year") or safe_get_text(issue.find("year"), "")
             if (not year) and y and y.isdigit():
                 year = y
@@ -260,10 +309,8 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
 
         link_url = safe_get_text(item.find("link_url"), "")
         link_api = safe_get_text(item.find("link_api"), "")
-        # 가능하면 사람에게 유용한 상세 링크를 우선
         link = link_url or link_api
 
-        # DBpia ID는 link_api에 포함될 때가 많아서 최대한 추출
         dbpia_id = ""
         if link_api:
             m = re.search(r"[?&]id=([^&]+)", link_api)
@@ -283,7 +330,7 @@ def parse_dbpia_xml(xml_text: str) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     if df.empty:
-        df = pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+        df = pd.DataFrame(columns=base_cols)
     return df
 
 def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True) -> pd.DataFrame:
@@ -291,50 +338,73 @@ def search_dbpia(keyword: str, max_results: int = 20, sort_by_date: bool = True)
     DBpia OpenAPI로 논문/학술자료 검색.
     - target=se_adv : 상세검색
     - itype=1 : 학술저널(논문) 중심
-    - sorttype=2 : 발행일순 (문서 기준)
+    - sorttype=2 : 발행일순
+    - sortorder=desc : 발행일순에서만 사용(문서 안내)
     """
-    if not dbpia_key:
-        return pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+    base_cols = ["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"]
 
-    # DBpia는 pagecount 기본 20. max_results 초과는 페이지를 돌며 합치기.
+    if not dbpia_key:
+        return pd.DataFrame(columns=base_cols)
+
     per_page = 20
     need = max(1, int(max_results))
     pages = (need - 1) // per_page + 1
 
     all_frames = []
     for p in range(1, pages + 1):
+        # ✅ 필수: key, target, (searchall 등 최소 1개)
         params = {
             "key": dbpia_key,
-            "target": "se_adv",
-            "searchall": keyword,
-            "itype": 1,                 # 1=학술저널
+            "target": "se_adv",        # 상세검색
+            "searchall": keyword,      # 최소 1개 필수
+            "itype": 1,                # 1=학술저널
             "pagecount": per_page,
             "pagenumber": p,
             "freeyn": "yes",
             "priceyn": "no",
         }
+
+        # ✅ 발행일순 정렬 + (발행일순에서만 sortorder 허용)
         if sort_by_date:
-            params["sorttype"] = 2      # 2=발행일순
+            params["sorttype"] = 2     # 2=발행일순
             params["sortorder"] = "desc"
 
         ok, xml_or_err = dbpia_request(params)
         if not ok:
-            # 페이지 하나라도 실패하면 경고만 띄우고 진행 (기능 유지)
             st.warning(f"DBpia API 호출 실패(p={p}): {xml_or_err}")
             continue
 
-        df = parse_dbpia_xml(xml_or_err)
+        # ✅ 에러 코드/메시지를 화면에 보여주기 (원인 파악용)
+        code, msg = extract_dbpia_error(xml_or_err)
+        if code or msg:
+            # 결과 없음(E0016)은 조용히 처리
+            if code != "E0016":
+                st.warning(f"DBpia API error(p={p}) → {code}: {msg}")
+            df = parse_dbpia_xml(xml_or_err)
+        else:
+            df = parse_dbpia_xml(xml_or_err)
+
         all_frames.append(df)
 
     if not all_frames:
-        return pd.DataFrame(columns=["제목", "저자", "학술지", "연도", "발행일", "페이지", "링크", "DBpiaID"])
+        return pd.DataFrame(columns=base_cols)
 
     out = pd.concat(all_frames, ignore_index=True)
 
-    # max_results 만큼 자르기 + 중복 제거(링크/제목 기준)
+    # 만약 에러가 DataFrame로 들어온 경우(제목 공백 + DBpiaID에 code:msg),
+    # 그 한 줄만 남는 걸 방지하고, 에러 행은 별도로 걸러내기(원하면 유지 가능)
+    if "DBpiaID" in out.columns:
+        # "E####:" 형태면 에러로 간주
+        err_mask = out["DBpiaID"].astype(str).str.match(r"^E\d{4}\s*:")
+        # 에러 행이 있고, 정상행도 있으면 에러행 제거
+        if err_mask.any() and (~err_mask).any():
+            out = out.loc[~err_mask].copy()
+
+    # 중복 제거 + 자르기
     if "링크" in out.columns:
         out = out.drop_duplicates(subset=["링크"], keep="first")
     out = out.head(need)
+
     return out
 
 # =====================
